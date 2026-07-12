@@ -512,10 +512,22 @@ function renderLibrary() {
       </div>
     </div>`;
 }
-function addPipe() { state.pipeLib.push({id:uid(), name:'15mm', idmm:13.6}); renderLibrary(); }
+const COMMON_PIPE_SIZES = [
+  { name: '8mm', idmm: 6.0 },
+  { name: '10mm', idmm: 8.0 },
+  { name: '15mm', idmm: 13.6 },
+  { name: '22mm', idmm: 20.2 },
+  { name: '28mm', idmm: 26.2 },
+  { name: '35mm', idmm: 32.6 },
+];
+function addPipe() {
+  const next = COMMON_PIPE_SIZES[state.pipeLib.length % COMMON_PIPE_SIZES.length];
+  state.pipeLib.push({id:uid(), name:next.name, idmm:next.idmm});
+  renderLibrary();
+}
 function updatePipe(id, field, val) { const p = state.pipeLib.find(p=>p.id===id); if(p){ p[field]=val; if(field!=='name') renderLibrary(); } }
 function removePipe(id) { state.pipeLib = state.pipeLib.filter(p=>p.id!==id); renderLibrary(); }
-function addRad() { state.radLib.push({id:uid(), name:'New radiator', outputAt50:1000}); renderLibrary(); }
+function addRad() { state.radLib.push({id:uid(), name:`New radiator ${state.radLib.length+1}`, outputAt50:1000}); renderLibrary(); }
 function updateRad(id, field, val) { const r = state.radLib.find(r=>r.id===id); if(r){ r[field]=val; if(field!=='name') renderLibrary(); } }
 function removeRad(id) { state.radLib = state.radLib.filter(r=>r.id!==id); renderLibrary(); }
 
