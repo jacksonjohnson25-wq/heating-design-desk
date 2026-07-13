@@ -4,8 +4,11 @@ let state = {
   rooms: [],
   pipeLib: [],
   radLib: [],
+  ashpLib: [],
   branches: [],
   dhw: { vdraw: 286, targetTemp: 60, targetReheatMinutes: 240 },
+  ashp: { controlStrategy: 'max' }, // 'max' = DHW priority control, 'sum' = simultaneous demand
+  fluid: { density: 990.24, viscosity: 0.000597, roughnessMm: 0.0015 }, // CIBSE p.5-42, defaults at 45°C MWT
 };
 let nextId = 1;
 const uid = () => nextId++;
@@ -21,6 +24,10 @@ const FHX_TABLE = { // Table 4-5, CIBSE p.4-26/27  [flowTemp][targetTemp] = fhx
 const F2_OPTIONS = [ ["TBSE (top+bottom same end)", 1.00], ["TBOE (top+bottom opposite ends)", 1.05], ["BOE (bottom opposite ends) — most common", 0.96] ];
 const F3_OPTIONS = [ ["Fixed on plain surface", 1.00], ["Shelf over radiator", 0.95], ["Fixed in open recess", 0.90], ["Cabinet, well ventilated", 0.80], ["Cabinet, poorly ventilated", 0.70] ];
 const F4_OPTIONS = [ ["Oil- or water-based paint", 1.00], ["Metallic-based paint", 0.85] ];
+const CONTROL_STRATEGY_OPTIONS = [
+  ["max", "DHW priority control (switches, use MAX of space heating & DHW)"],
+  ["sum", "Simultaneous demand possible (use SUM of space heating & DHW)"],
+];
 
 /* ===================== CALCULATIONS ===================== */
 function mwt() { return (state.project.flowTemp + state.project.returnTemp) / 2; }
@@ -52,15 +59,41 @@ function suggestRadiator(requiredW) {
   return candidates[0] || null;
 }
 
+/* ---- Pipe length estimation: trace the route, add a riser if upstairs, add a margin.
+   Practical estimation method, not a CIBSE-defined formula — verify against the actual
+   routed drawing (e.g. measured in AutoCAD) before finalising a live design. ---- */
+function branchLength(branch) {
+  const horiz = Number(branch.horizRoute) || 0;
+  const riser = branch.upstairs ? (Number(branch.riserHeight) || 0) : 0;
+  const margin = (Number(branch.marginPct) || 0) / 100;
+  return (horiz + riser) * (1 + margin);
+}
+
+/* ---- Pressure loss rate (Pa/m): Darcy-Weisbach with the Swamee-Jain explicit
+   approximation to Colebrook-White (avoids an iterative solve). Equivalent method to
+   CIBSE Table 5-3 to Table 5-6 (Section 5.5.5.1, p.5-42), using project fluid properties
+   instead of a printed lookup table. ---- */
+function pressureLossRatePerM(flowLs, idmm) {
+  const v = velocityForPipe(flowLs, idmm);
+  const D = idmm / 1000; // m
+  const rho = state.fluid.density, mu = state.fluid.viscosity, roughM = state.fluid.roughnessMm / 1000;
+  if (v <= 0 || D <= 0) return 0;
+  const Re = (rho * v * D) / mu;
+  const f = 0.25 / Math.pow(Math.log10((roughM / (3.7 * D)) + (5.74 / Math.pow(Re, 0.9))), 2);
+  return f * rho * Math.pow(v, 2) / (2 * D); // Pa/m
+}
+
 function branchCalc(branch) {
   const room = state.rooms.find(r => r.id === branch.roomId);
   if (!room) return null;
   const deltaT = state.project.flowTemp - state.project.returnTemp;
   const flow = flowRateLs(room.heatLoss, deltaT);
   const picked = pickPipeForFlow(flow);
-  const resistanceLength = (Number(branch.length)||0) + (Number(branch.fittingsAllowance)||0);
-  const pressureDrop = resistanceLength * (Number(branch.pressureLossRate)||0);
-  return { room, flow, picked, resistanceLength, pressureDrop };
+  const length = branchLength(branch);
+  const resistanceLength = length + (Number(branch.fittingsAllowance)||0);
+  const rate = picked ? pressureLossRatePerM(flow, picked.pipe.idmm) : 0;
+  const pressureDrop = resistanceLength * rate;
+  return { room, flow, picked, length, resistanceLength, rate, pressureDrop };
 }
 
 function dhwCylinderVolume() {
@@ -84,6 +117,31 @@ function dhwReheatTime(ratingKw) {
   return (state.dhw.targetTemp * state.project.dhwFlowTemp * vcyl * fhx) / ratingKw;
 }
 
+/* ---- ASHP sizing: MIS 3005-D requires a heat pump be selected to provide at least
+   100% of the calculated space heating heat loss (BS EN 12831-1:2017). Whether/how to
+   add a DHW allowance on top is a designer judgement call, not a fixed formula in the
+   standard — see CIBSE DHDG Section 3.5.3 (DHW priority control). ---- */
+function totalHeatLossW() { return state.rooms.reduce((s,r)=>s+(Number(r.heatLoss)||0),0); }
+
+function ashpSpaceHeatingKw() { return totalHeatLossW() / 1000; }
+
+function ashpDhwKw() {
+  const rating = dhwRequiredRating();
+  return (rating === null || isNaN(rating)) ? null : rating;
+}
+
+function ashpRequiredDutyKw() {
+  const spaceKw = ashpSpaceHeatingKw();
+  const dhwKw = ashpDhwKw();
+  if (dhwKw === null) return spaceKw;
+  return state.ashp.controlStrategy === 'sum' ? spaceKw + dhwKw : Math.max(spaceKw, dhwKw);
+}
+
+function suggestAshp(requiredKw) {
+  const candidates = state.ashpLib.filter(m => Number(m.outputKw) >= requiredKw).sort((a,b)=>a.outputKw-b.outputKw);
+  return candidates[0] || null;
+}
+
 /* ===================== EXPORT / IMPORT ===================== */
 function exportData() {
   const blob = new Blob([JSON.stringify(state, null, 2)], {type:'application/json'});
@@ -97,8 +155,12 @@ function importData(file) {
   reader.onload = e => {
     try {
       const parsed = JSON.parse(e.target.result);
-      state = Object.assign({project:{},rooms:[],pipeLib:[],radLib:[],branches:[],dhw:{}}, parsed);
-      nextId = 1 + Math.max(0, ...[...state.rooms,...state.pipeLib,...state.radLib,...state.branches].map(x=>x.id||0));
+      state = Object.assign({
+        project:{}, rooms:[], pipeLib:[], radLib:[], ashpLib:[], branches:[], dhw:{},
+        ashp:{controlStrategy:'max'},
+        fluid:{density:990.24, viscosity:0.000597, roughnessMm:0.0015},
+      }, parsed);
+      nextId = 1 + Math.max(0, ...[...state.rooms,...state.pipeLib,...state.radLib,...state.ashpLib,...state.branches].map(x=>x.id||0));
       renderAll();
     } catch(err) { alert('Could not read that file — is it a project JSON exported from this tool?'); }
   };
@@ -110,6 +172,7 @@ const TABS = [
   { id: 'rooms', label: 'Rooms & heat loss' },
   { id: 'radiators', label: 'Radiator sizing' },
   { id: 'hotwater', label: 'Hot water cylinder' },
+  { id: 'ashp', label: 'ASHP sizing' },
   { id: 'pipework', label: 'Pipework sizing' },
   { id: 'library', label: 'Reference library' },
 ];
@@ -142,7 +205,7 @@ function renderRooms() {
       <div class="panel-head">
         <div class="panel-eyebrow">Step 01</div>
         <div class="panel-title">Rooms &amp; heat loss</div>
-        <div class="panel-sub">Enter each room's heat loss result from your survey (Elmhurst, Heat Engineer, or manual CIBSE Section 2 calculation). Everything downstream — radiator sizing, pipe sizing — is driven by this table.</div>
+        <div class="panel-sub">Enter each room's heat loss result from your survey (Elmhurst, Heat Engineer, or manual CIBSE Section 2 calculation). Everything downstream — radiator sizing, ASHP sizing, pipe sizing — is driven by this table.</div>
       </div>
 
       <div class="card">
@@ -355,15 +418,82 @@ function renderHotWater() {
           <div><label>Required heat exchanger rating (calculated)</label><input value="${ratingForTarget.toFixed(2)} kW" disabled></div>
         </div>
         <div class="note">${state.dhw.targetReheatMinutes < 120 ? 'Reheat times under 120 minutes: CIBSE recommends checking fabric/insulation improvements, rescheduling the reheat window, or splitting reheat periods before oversizing the heat generator — see the note in your study guide.' : 'Round the rating up to the nearest available cylinder heat exchanger option when specifying.'}</div>
+        <div class="note">This rating feeds automatically into ASHP Sizing (Step 04) as the DHW reheat demand.</div>
       </div>` : ''}
     </div>`;
 }
 function updateDhw(field, val) { state.dhw[field] = val; renderAll(); }
 
+/* ===================== RENDER: ASHP SIZING ===================== */
+function renderAshp() {
+  if (!state.rooms.length) {
+    document.getElementById('main').innerHTML = `<div class="panel active">${panelHead('Step 04','ASHP sizing','Add rooms first — ASHP sizing needs the total building heat loss.')}<div class="card"><div class="empty"><div class="empty-title">No rooms yet</div>Go to "Rooms &amp; heat loss" and add at least one room.</div></div></div>`;
+    return;
+  }
+  const spaceKw = ashpSpaceHeatingKw();
+  const dhwKw = ashpDhwKw();
+  const required = ashpRequiredDutyKw();
+  const suggestion = suggestAshp(required);
+
+  const modelRows = state.ashpLib.map(m => {
+    const meets = Number(m.outputKw) >= required;
+    return `<tr>
+      <td><input value="${m.name}" oninput="updateAshpModel(${m.id},'name',this.value)" style="border:none;background:transparent;padding:2px;font-family:var(--font-ui)"></td>
+      <td><input type="number" step="0.1" value="${m.outputKw}" oninput="updateAshpModel(${m.id},'outputKw',+this.value)" style="border:none;background:transparent;padding:2px" class="numcell"></td>
+      <td><input type="number" value="${m.designOutdoorTempC}" oninput="updateAshpModel(${m.id},'designOutdoorTempC',+this.value)" style="border:none;background:transparent;padding:2px" class="numcell"></td>
+      <td><input type="number" value="${m.flowTempUsedC}" oninput="updateAshpModel(${m.id},'flowTempUsedC',+this.value)" style="border:none;background:transparent;padding:2px" class="numcell"></td>
+      <td>${meets ? `<span class="badge badge-ok">Yes</span>` : `<span class="badge badge-danger">No</span>`}</td>
+      <td><button class="btn-danger-ghost" onclick="removeAshpModel(${m.id})">Remove</button></td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('main').innerHTML = `
+    <div class="panel active">
+      ${panelHead('Step 04','ASHP sizing','MIS 3005-D requires a heat pump be selected to provide at least 100% of the calculated space heating heat loss (BS EN 12831-1:2017). DHW allowance and control strategy are a designer judgement call, not a fixed formula in the standard.')}
+
+      <div class="card">
+        <div class="card-title">Demand &amp; control strategy</div>
+        <div class="result-strip">
+          <div class="result-item"><div class="result-label">Space heating demand</div><div class="result-value">${spaceKw.toFixed(2)}<span class="result-unit">kW</span></div></div>
+          <div class="result-item"><div class="result-label">DHW reheat demand (from Step 03)</div><div class="result-value">${dhwKw===null ? 'n/a' : dhwKw.toFixed(2)}<span class="result-unit">${dhwKw===null?'':'kW'}</span></div></div>
+        </div>
+        <div class="grid g2" style="margin-top:16px">
+          <div><label>Control strategy</label>
+            <select onchange="updateAshpSetting('controlStrategy',this.value)">
+              ${CONTROL_STRATEGY_OPTIONS.map(([v,l])=>`<option value="${v}" ${state.ashp.controlStrategy===v?'selected':''}>${l}</option>`).join('')}
+            </select>
+          </div>
+          <div><label>Required peak ASHP duty (calculated)</label><input value="${required.toFixed(2)} kW" disabled></div>
+        </div>
+        <div class="note">Confirm your chosen control strategy with your supervising engineer — see CIBSE DHDG Section 3.5.3 (DHW priority control) and the index circuit note in Section 5.5.5.4, p.5-46.</div>
+      </div>
+
+      <div class="card">
+        <div class="toolbar">
+          <div class="card-title" style="margin:0">Candidate ASHP models</div>
+          <button class="btn btn-primary" onclick="addAshpModel()">+ Add model</button>
+        </div>
+        ${state.ashpLib.length ? `
+        <table>
+          <thead><tr><th>Model</th><th class="numcell">Rated output at design conditions (kW)</th><th class="numcell">Design outdoor temp used (°C)</th><th class="numcell">Flow temp used (°C)</th><th>Meets requirement?</th><th></th></tr></thead>
+          <tbody>${modelRows}</tbody>
+        </table>` : `<div class="empty"><div class="empty-title">No candidate models yet</div>Add manufacturer performance data to compare options.</div>`}
+        <div class="note">Enter each manufacturer's rated output <b>at your design outdoor air temperature and required flow temperature</b> — not the headline/nameplate rating, usually quoted at a milder reference condition (e.g. 7°C outdoor / 35°C flow).</div>
+        ${state.ashpLib.length ? `<div class="result-strip" style="margin-top:18px;border-top:1px solid var(--line);padding-top:16px">
+          <div class="result-item"><div class="result-label">Recommended selection (smallest model meeting requirement)</div><div class="result-value copper">${suggestion ? suggestion.name : 'No model meets requirement'}</div></div>
+        </div>` : ''}
+      </div>
+    </div>`;
+}
+function addAshpModel() { state.ashpLib.push({id:uid(), name:`New model ${state.ashpLib.length+1}`, outputKw:8, designOutdoorTempC:-3, flowTempUsedC:state.project.dhwFlowTemp||65}); renderAshp(); }
+function updateAshpModel(id, field, val) { const m = state.ashpLib.find(m=>m.id===id); if(m){ m[field]=val; if(field!=='name') renderAshp(); } }
+function removeAshpModel(id) { state.ashpLib = state.ashpLib.filter(m=>m.id!==id); renderAshp(); }
+function updateAshpSetting(field, val) { state.ashp[field] = val; renderAshp(); }
+
 /* ===================== RENDER: PIPEWORK ===================== */
 function renderPipework() {
   if (!state.rooms.length) {
-    document.getElementById('main').innerHTML = `<div class="panel active">${panelHead('Step 04','Pipework sizing','Add rooms first.')}<div class="card"><div class="empty"><div class="empty-title">No rooms yet</div></div></div></div>`;
+    document.getElementById('main').innerHTML = `<div class="panel active">${panelHead('Step 05','Pipework sizing','Add rooms first.')}<div class="card"><div class="empty"><div class="empty-title">No rooms yet</div></div></div></div>`;
     return;
   }
   const branchRows = state.branches.map(b => {
@@ -378,9 +508,18 @@ function renderPipework() {
       </td>
       <td class="numcell">${c.flow.toFixed(4)} L/s</td>
       <td>${c.picked ? `<span class="badge ${vOk?'badge-ok':'badge-danger'}">${c.picked.pipe.name} — ${c.picked.velocity.toFixed(2)} m/s</span>` : `<span class="badge badge-neutral">No pipe fits — add to library</span>`}</td>
-      <td><input type="number" value="${b.length}" oninput="updateBranch(${b.id},'length',+this.value)" style="width:70px"></td>
-      <td><input type="number" value="${b.fittingsAllowance}" oninput="updateBranch(${b.id},'fittingsAllowance',+this.value)" style="width:70px"></td>
-      <td><input type="number" value="${b.pressureLossRate}" oninput="updateBranch(${b.id},'pressureLossRate',+this.value)" style="width:70px"></td>
+      <td><input type="number" step="0.1" value="${b.horizRoute}" oninput="updateBranch(${b.id},'horizRoute',+this.value)" style="width:64px"></td>
+      <td>
+        <select onchange="updateBranch(${b.id},'upstairs',this.value==='yes')" style="width:70px">
+          <option value="no" ${!b.upstairs?'selected':''}>No</option>
+          <option value="yes" ${b.upstairs?'selected':''}>Yes</option>
+        </select>
+      </td>
+      <td><input type="number" step="0.1" value="${b.riserHeight}" oninput="updateBranch(${b.id},'riserHeight',+this.value)" style="width:64px" ${b.upstairs?'':'disabled'}></td>
+      <td><input type="number" value="${b.marginPct}" oninput="updateBranch(${b.id},'marginPct',+this.value)" style="width:56px"></td>
+      <td class="numcell">${c.length.toFixed(2)} m</td>
+      <td><input type="number" value="${b.fittingsAllowance}" oninput="updateBranch(${b.id},'fittingsAllowance',+this.value)" style="width:64px"></td>
+      <td class="numcell">${c.rate.toFixed(1)} Pa/m</td>
       <td class="numcell" style="font-weight:600">${c.pressureDrop.toFixed(1)} Pa</td>
       <td><button class="btn-danger-ghost" onclick="removeBranch(${b.id})">Remove</button></td>
     </tr>`;
@@ -409,8 +548,12 @@ function renderPipework() {
 
   document.getElementById('main').innerHTML = `
     <div class="panel active">
-      ${panelHead('Step 04','Pipework sizing','CIBSE Equation 5.1 (p.5-31) for flow rate, velocity-checked against your pipe library (target ~1.0 m/s, range 0.3–1.5 m/s).')}
+      ${panelHead('Step 05','Pipework sizing','CIBSE Equation 5.1 (p.5-31) for flow rate, velocity-checked against your pipe library (target ~1.0 m/s, range 0.3–1.5 m/s). Pressure drop rate is calculated directly (Darcy-Weisbach / Swamee-Jain, CIBSE p.5-42 method) from your fluid property assumptions in the Reference Library tab — it is no longer a manual entry.')}
       ${velocityGaugeCard()}
+      <div class="card">
+        <div class="card-title">Pipe length — trace the route</div>
+        <div class="note" style="margin-top:0">Locate the manifold, trace the route along walls/corridors to each radiator (never diagonally across a room), and sum the wall-run dimensions on the drawing that lie along that route. Add a riser if the room is upstairs, then a margin for real-world offsets not shown as labelled dimensions. This is a practical estimation method, not a CIBSE-defined formula — verify against the actual routed drawing (e.g. measured in AutoCAD) before finalising.</div>
+      </div>
       <div class="card">
         <div class="toolbar">
           <div class="card-title" style="margin:0">Branches</div>
@@ -418,7 +561,7 @@ function renderPipework() {
         </div>
         ${state.branches.length ? `
         <table>
-          <thead><tr><th>Room</th><th class="numcell">Flow rate</th><th>Pipe &amp; velocity</th><th>Length (m)</th><th>Fittings (m)</th><th>ΔP rate (Pa/m)</th><th class="numcell">Total ΔP</th><th></th></tr></thead>
+          <thead><tr><th>Room</th><th class="numcell">Flow rate</th><th>Pipe &amp; velocity</th><th>Horiz. route (m)</th><th>Upstairs?</th><th>Riser (m)</th><th>Margin (%)</th><th class="numcell">Length</th><th>Fittings (m)</th><th class="numcell">ΔP rate (Pa/m)</th><th class="numcell">Total ΔP</th><th></th></tr></thead>
           <tbody>${branchRows}</tbody>
         </table>` : `<div class="empty"><div class="empty-title">No branches yet</div>Add a branch per room to calculate its pipe size.</div>`}
         ${!state.pipeLib.length ? `<div class="note warn">Your pipe library is empty — add real sizes from your pipe manufacturer's datasheet in the Reference Library tab before these results mean anything.</div>` : ''}
@@ -428,7 +571,7 @@ function renderPipework() {
 }
 function addBranch() {
   if (!state.rooms.length) return;
-  state.branches.push({id:uid(), roomId: state.rooms[0].id, length:8, fittingsAllowance:1.5, pressureLossRate:250});
+  state.branches.push({id:uid(), roomId: state.rooms[0].id, horizRoute:3.5, upstairs:false, riserHeight:2.6, marginPct:10, fittingsAllowance:1.5});
   renderPipework();
 }
 function updateBranch(id, field, val) { const b = state.branches.find(b=>b.id===id); if(b){ b[field]=val; renderPipework(); } }
@@ -490,7 +633,7 @@ function renderLibrary() {
 
   document.getElementById('main').innerHTML = `
     <div class="panel active">
-      ${panelHead('Step 05','Reference library','This tool ships empty on purpose — enter real figures from your chosen pipe manufacturer\u2019s technical guide and radiator supplier\u2019s catalogue (BS EN 442 \u039450 rating). Export your library once built so your whole team can import the same file.')}
+      ${panelHead('Step 06','Reference library','This tool ships empty on purpose — enter real figures from your chosen pipe manufacturer\u2019s technical guide and radiator supplier\u2019s catalogue (BS EN 442 \u039450 rating). Export your library once built so your whole team can import the same file.')}
 
       <div class="card">
         <div class="toolbar"><div class="card-title" style="margin:0">Pipe sizes</div><button class="btn btn-primary" onclick="addPipe()">+ Add pipe size</button></div>
@@ -503,8 +646,18 @@ function renderLibrary() {
       </div>
 
       <div class="card">
+        <div class="card-title">Fluid properties <small>used for pipework pressure drop, CIBSE p.5-42</small></div>
+        <div class="grid g3">
+          <div><label>Water density, ρ (kg/m³)</label><input type="number" step="0.01" value="${state.fluid.density}" oninput="updateFluid('density',+this.value)"></div>
+          <div><label>Dynamic viscosity, μ (Pa·s)</label><input type="number" step="0.000001" value="${state.fluid.viscosity}" oninput="updateFluid('viscosity',+this.value)"></div>
+          <div><label>Absolute roughness (mm)</label><input type="number" step="0.0001" value="${state.fluid.roughnessMm}" oninput="updateFluid('roughnessMm',+this.value)"></div>
+        </div>
+        <div class="note">Defaults are CIBSE's own values at 45°C mean water temperature (990.24 kg/m³, 5.97×10⁻⁴ Pa·s, 0.0015mm for copper). Adjust if your system's actual mean water temperature differs significantly — e.g. CIBSE lists 994.03 kg/m³ at 35°C MWT.</div>
+      </div>
+
+      <div class="card">
         <div class="card-title">Save &amp; share your project</div>
-        <div class="note">Export includes rooms, radiator/pipe libraries, branches and hot water settings — everything in this session. No data ever leaves this page automatically.</div>
+        <div class="note">Export includes rooms, radiator/pipe/ASHP libraries, branches, hot water and fluid property settings — everything in this session. No data ever leaves this page automatically.</div>
         <div class="btn-row">
           <button class="btn btn-primary" onclick="exportData()">↓ Export project (.json)</button>
           <button class="btn btn-ghost" onclick="document.getElementById('importInput').click()">↑ Import project</button>
@@ -530,6 +683,7 @@ function removePipe(id) { state.pipeLib = state.pipeLib.filter(p=>p.id!==id); re
 function addRad() { state.radLib.push({id:uid(), name:`New radiator ${state.radLib.length+1}`, outputAt50:1000}); renderLibrary(); }
 function updateRad(id, field, val) { const r = state.radLib.find(r=>r.id===id); if(r){ r[field]=val; if(field!=='name') renderLibrary(); } }
 function removeRad(id) { state.radLib = state.radLib.filter(r=>r.id!==id); renderLibrary(); }
+function updateFluid(field, val) { state.fluid[field] = val; renderLibrary(); }
 
 /* ===================== SHARED ===================== */
 function panelHead(eyebrow, title, sub) {
@@ -542,6 +696,7 @@ function renderAll() {
   if (activeTab==='rooms') renderRooms();
   else if (activeTab==='radiators') renderRadiators();
   else if (activeTab==='hotwater') renderHotWater();
+  else if (activeTab==='ashp') renderAshp();
   else if (activeTab==='pipework') renderPipework();
   else if (activeTab==='library') renderLibrary();
 }
